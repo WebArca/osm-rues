@@ -4,14 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Extracteur de rues OSM (sélection → CSV)</title>
-
-  <!-- Leaflet (jsDelivr, sans SRI pour compat maximale) -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
-  <script defer src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-  <!-- Leaflet.draw -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
-  <script defer src="https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
-
   <style>
     :root { --bg:#0f172a; --muted:#f8fafc; --line:#e2e8f0; --brand:#0284c7; }
     html, body { height: 100%; margin: 0; }
@@ -39,6 +31,7 @@
   </style>
 </head>
 <body>
+<noscript style="padding:1rem;color:#b91c1c;">Activez JavaScript pour afficher la carte.</noscript>
 <div id="app">
   <header>
     <h1>Extracteur de rues OSM — dessinez ou utilisez la vue courante, exportez en CSV</h1>
@@ -53,7 +46,8 @@
 
     <div class="group">
       <label for="types">Types de voies (regex) :</label>
-      <input id="types" size="42" value="^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|pedestrian)$" />
+      <input id="types" size="42"
+             value="^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|pedestrian)$" />
     </div>
 
     <div class="group">
@@ -84,194 +78,232 @@
 </div>
 
 <script>
+/** Chargeurs multi-CDN (Leaflet + Leaflet.draw) **/
 (function(){
-  // --- Si les CDN sont bloqués, on affiche un message clair
-  if (typeof L === "undefined") {
-    const m = document.getElementById('messages');
-    if (m) {
-      m.innerHTML = '<div class="err"><strong>Erreur :</strong> Leaflet n’a pas été chargé (CDN bloqué). Essayez un autre navigateur, désactivez le bloqueur de contenu, ou remplacez les balises <em>leaflet</em> par un autre CDN.</div>';
-    } else {
-      alert("Leaflet non chargé (CDN bloqué).");
-    }
-    return;
-  }
-
-  // --- Helpers UI
   const logEl = document.getElementById('messages');
-  function log(msg, cls){ const p = document.createElement('div'); if (cls) p.className = cls; p.textContent = msg; logEl.prepend(p); }
-  const badgeUnique = id('count-unique');
-  const badgeRaw    = id('count-raw');
-  function setCounts(u, r) {
-    badgeUnique.textContent = `${u} ${u>1?'noms uniques':'nom unique'}`;
-    badgeRaw.textContent    = `${r} ${r>1?'tronçons':'tronçon'}`;
+  function log(msg, cls){ const p=document.createElement('div'); if(cls)p.className=cls; p.textContent=msg; logEl && logEl.prepend(p); }
+
+  function loadCSS(href){
+    return new Promise((resolve,reject)=>{
+      const l=document.createElement('link'); l.rel='stylesheet'; l.href=href;
+      l.onload=()=>resolve(); l.onerror=()=>reject(new Error('CSS fail '+href));
+      document.head.appendChild(l);
+    });
   }
-  function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob); const a = document.createElement('a');
-    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 500);
+  function loadJS(src){
+    return new Promise((resolve,reject)=>{
+      const s=document.createElement('script'); s.src=src; s.defer=true;
+      s.onload=()=>resolve(); s.onerror=()=>reject(new Error('JS fail '+src));
+      document.head.appendChild(s);
+    });
   }
-  function escapeHtml(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-  function id(x){return document.getElementById(x)}
-
-  // --- Leaflet Map
-  const map = L.map('map');
-  map.setView([44.657, -1.17], 14);
-  const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(map);
-  tiles.on('tileerror', e => log('Erreur de tuiles OSM (tileerror). Vérifiez votre bloqueur de contenu.', 'warn'));
-
-  map.whenReady(()=>{ log('Carte prête.', 'ok'); setTimeout(()=>map.invalidateSize(),100); });
-  window.addEventListener('resize', ()=> setTimeout(()=>map.invalidateSize(),100));
-
-  const drawnItems = new L.FeatureGroup();
-  map.addLayer(drawnItems);
-  const drawControl = new L.Control.Draw({
-    draw: { polyline:false, circle:false, marker:false, circlemarker:false,
-      polygon:{allowIntersection:false, showArea:true, metric:true},
-      rectangle:{showArea:true, metric:true}
-    },
-    edit: { featureGroup: drawnItems }
-  });
-  map.addControl(drawControl);
-
-  map.on(L.Draw.Event.CREATED, e => {
-    drawnItems.addLayer(e.layer);
-    log('Forme ajoutée. Vous pouvez l’éditer avant recherche.');
-  });
-
-  id('btn-clear').addEventListener('click', ()=>{
-    drawnItems.clearLayers();
-    setCounts(0,0);
-    id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
-    id('table-wrap').innerHTML='';
-    log('Sélection effacée.');
-  });
-
-  // --- Conversions géométriques
-  function layerToPolyString(layer){
-    const latlngs = layer.getLatLngs();
-    const ring = Array.isArray(latlngs[0]) ? latlngs[0] : latlngs;
-    const coords = ring.map(ll=>[ll.lat, ll.lng]);
-    const first = coords[0], last = coords[coords.length-1];
-    if (first[0]!==last[0] || first[1]!==last[1]) coords.push(first);
-    return coords.map(([lat,lon])=>`${lat} ${lon}`).join(' ');
-  }
-  function getLastPolygonPoly(){
-    const layers = Object.values(drawnItems._layers);
-    if (!layers.length) return null;
-    const layer = layers[layers.length-1];
-    if (!('getLatLngs' in layer)) return null;
-    return layerToPolyString(layer);
-  }
-  function getBbox(){
-    const b = map.getBounds();
-    const south = b.getSouth(), west = b.getWest(), north = b.getNorth(), east = b.getEast();
-    return `${south},${west},${north},${east}`;
+  async function loadFirstWorking(pairs, label){
+    let lastErr=null;
+    for (const p of pairs){
+      try{
+        log(`Chargement ${label} : ${new URL(p.js).host}`,'warn');
+        await loadCSS(p.css);
+        await loadJS(p.js);
+        log(`${label} chargé : ${new URL(p.js).host}`,'ok');
+        return true;
+      }catch(e){ lastErr=e; log(`${label} échec : ${e.message}`,'err'); }
+    }
+    throw lastErr || new Error(`${label} introuvable`);
   }
 
-  // --- Build Overpass QL
-  function buildQL({usePoly, polyStr, useBbox, bboxStr}){
-    const endpoint = id('endpoint').value;
-    const typesRe = (id('types').value || '').trim();
-    const typeFilter = typesRe ? `["highway"~"${typesRe}"]` : '["highway"]';
-    const loc = usePoly ? `(poly:"${polyStr}")` : useBbox ? `(${bboxStr})` : '';
-    const ql = `[
+  const leafletCDNs = [
+    {css:"https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css", js:"https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"},
+    {css:"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",            js:"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"},
+    {css:"https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css", js:"https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"},
+  ];
+  const drawCDNs = [
+    {css:"https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.css", js:"https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.js"},
+    {css:"https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css",            js:"https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"},
+    {css:"https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css", js:"https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"},
+  ];
+
+  (async function boot(){
+    try {
+      await loadFirstWorking(leafletCDNs, 'Leaflet');
+      await loadFirstWorking(drawCDNs, 'Leaflet.draw');
+      initApp();
+    } catch(e){
+      log('Erreur critique de chargement : '+e.message,'err');
+      alert('Erreur de chargement des bibliothèques :\\n'+e.message+'\\nEssayez un autre navigateur ou un autre réseau (certains CDN peuvent être bloqués).');
+    }
+  })();
+
+  /** Application après chargement des libs **/
+  function initApp(){
+    const badgeUnique = id('count-unique');
+    const badgeRaw    = id('count-raw');
+    function setCounts(u, r) {
+      badgeUnique.textContent = `${u} ${u>1?'noms uniques':'nom unique'}`;
+      badgeRaw.textContent    = `${r} ${r>1?'tronçons':'tronçon'}`;
+    }
+    function id(x){return document.getElementById(x)}
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+      setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 500);
+    }
+    function escapeHtml(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+    function log(msg, cls){ const p=document.createElement('div'); if(cls)p.className=cls; p.textContent=msg; logEl.prepend(p); }
+
+    // --- Carte + fallback de tuiles
+    const map = L.map('map');
+    map.setView([44.657, -1.17], 14);
+    const tileProviders = [
+      {url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',           attr:'&copy; OpenStreetMap contributors'},
+      {url:'https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png',  attr:'&copy; OpenStreetMap, tiles: osmfr'},
+      {url:'https://{s}.tile.openstreetmap.de/{z}/{x}/{y}.png',        attr:'&copy; OpenStreetMap, tiles: DE'},
+    ];
+    let tileIndex = 0;
+    let tiles = L.tileLayer(tileProviders[tileIndex].url, {maxZoom:19, attribution: tileProviders[tileIndex].attr}).addTo(map);
+    tiles.on('tileerror', ()=>{
+      log('Erreur de tuiles. Bascule vers un autre serveur…', 'warn');
+      if (tileIndex < tileProviders.length - 1){
+        tileIndex++;
+        map.removeLayer(tiles);
+        tiles = L.tileLayer(tileProviders[tileIndex].url, {maxZoom:19, attribution: tileProviders[tileIndex].attr}).addTo(map);
+      } else {
+        log('Tous les serveurs de tuiles ont échoué.', 'err');
+      }
+    });
+
+    map.whenReady(()=>{ log('Carte prête.','ok'); setTimeout(()=>map.invalidateSize(),100); });
+    window.addEventListener('resize', ()=> setTimeout(()=>map.invalidateSize(),100));
+
+    // --- Dessin
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+    const drawControl = new L.Control.Draw({
+      draw: { polyline:false, circle:false, marker:false, circlemarker:false,
+        polygon:{allowIntersection:false, showArea:true, metric:true},
+        rectangle:{showArea:true, metric:true}
+      },
+      edit: { featureGroup: drawnItems }
+    });
+    map.addControl(drawControl);
+    map.on(L.Draw.Event.CREATED, e => { drawnItems.addLayer(e.layer); log('Forme ajoutée. Vous pouvez l’éditer avant recherche.'); });
+
+    id('btn-clear').addEventListener('click', ()=>{
+      drawnItems.clearLayers(); setCounts(0,0);
+      id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
+      id('table-wrap').innerHTML=''; log('Sélection effacée.');
+    });
+
+    // --- Conversions géométriques
+    function layerToPolyString(layer){
+      const latlngs = layer.getLatLngs();
+      const ring = Array.isArray(latlngs[0]) ? latlngs[0] : latlngs;
+      const coords = ring.map(ll=>[ll.lat, ll.lng]);
+      const first=coords[0], last=coords[coords.length-1];
+      if (first[0]!==last[0] || first[1]!==last[1]) coords.push(first);
+      return coords.map(([lat,lon])=>`${lat} ${lon}`).join(' ');
+    }
+    function getLastPolygonPoly(){
+      const layers = Object.values(drawnItems._layers);
+      if (!layers.length) return null; const layer = layers[layers.length-1];
+      if (!('getLatLngs' in layer)) return null; return layerToPolyString(layer);
+    }
+    function getBbox(){
+      const b = map.getBounds();
+      return `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
+    }
+
+    // --- Overpass: QL + requêtes
+    function buildQL({usePoly, polyStr, useBbox, bboxStr}){
+      const endpoint = id('endpoint').value;
+      const typesRe = (id('types').value || '').trim();
+      const typeFilter = typesRe ? `["highway"~"${typesRe}"]` : '["highway"]';
+      const loc = usePoly ? `(poly:"${polyStr}")` : useBbox ? `(${bboxStr})` : '';
+      const ql = `[
   out:json][timeout:60];
   way${typeFilter}["name"]${loc};
   out tags;`;
-    return { endpoint, ql };
-  }
-
-  // --- Query Overpass (POST puis fallback GET)
-  async function runOverpass(ql, endpoint){
-    log('Requête Overpass envoyée…');
-    try {
-      const res = await fetch(endpoint, {
-        method:'POST', mode:'cors',
-        headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
-        body: new URLSearchParams({ data: ql })
-      });
-      if (!res.ok) { const t = await res.text(); throw new Error(`POST ${res.status}: ${t.slice(0,200)}…`); }
-      return await res.json();
-    } catch(e){
-      log('POST en échec, tentative GET…', 'warn');
-      const url = endpoint + '?' + new URLSearchParams({ data: ql+"\n" }) + `&t=`+Date.now();
-      const res2 = await fetch(url, { mode:'cors' });
-      if (!res2.ok) { const t2 = await res2.text(); throw new Error(`GET ${res2.status}: ${t2.slice(0,200)}…`); }
-      return await res2.json();
+      return { endpoint, ql };
     }
-  }
-
-  // --- Rendu & CSV
-  let rowsRaw = [], rowsUnique = [];
-  function renderTable(rows){
-    const wrap = id('table-wrap');
-    if (!rows.length){ wrap.innerHTML = '<p>Aucun résultat.</p>'; return; }
-    const header = '<tr><th>name</th><th>highway</th><th>@id</th></tr>';
-    const trs = rows.map(r=>`<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.highway||'')}</td><td>${escapeHtml(r.id)}</td></tr>`).join('');
-    wrap.innerHTML = `<table>${header}${trs}</table>`;
-  }
-  function toCSV(rows, cols){
-    const esc = v => '"'+String(v??'').replace(/"/g,'""')+'"';
-    const lines = [cols.join(',')];
-    for (const r of rows){ lines.push(cols.map(c=>esc(r[c])).join(',')); }
-    return lines.join('\n');
-  }
-  function process(json){
-    rowsRaw = (json.elements||[])
-      .filter(el=>el.type==='way' && el.tags && el.tags.name)
-      .map(el=>({ name: el.tags.name, highway: el.tags.highway||'', id: el.id }));
-
-    const seen = new Set();
-    rowsUnique = [];
-    for (const r of rowsRaw){
-      const k = r.name.toLowerCase().trim();
-      if (!seen.has(k)){ seen.add(k); rowsUnique.push({ name: r.name }); }
+    async function runOverpass(ql, endpoint){
+      log('Requête Overpass envoyée…');
+      try {
+        const res = await fetch(endpoint, {
+          method:'POST', mode:'cors',
+          headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+          body: new URLSearchParams({ data: ql })
+        });
+        if (!res.ok) { const t = await res.text(); throw new Error(`POST ${res.status}: ${t.slice(0,200)}…`); }
+        return await res.json();
+      } catch(e){
+        log('POST en échec, tentative GET…','warn');
+        const url = endpoint + '?' + new URLSearchParams({ data: ql+"\n" }) + `&t=`+Date.now();
+        const res2 = await fetch(url, { mode:'cors' });
+        if (!res2.ok) { const t2 = await res2.text(); throw new Error(`GET ${res2.status}: ${t2.slice(0,200)}…`); }
+        return await res2.json();
+      }
     }
-    rowsUnique.sort((a,b)=>a.name.localeCompare(b.name,'fr'));
 
-    setCounts(rowsUnique.length, rowsRaw.length);
-    renderTable(rowsRaw);
-    id('btn-dl-unique').disabled = rowsUnique.length===0;
-    id('btn-dl-raw').disabled = rowsRaw.length===0;
+    // --- Rendu & CSV
+    let rowsRaw = [], rowsUnique = [];
+    function renderTable(rows){
+      const wrap = id('table-wrap');
+      if (!rows.length){ wrap.innerHTML = '<p>Aucun résultat.</p>'; return; }
+      const header = '<tr><th>name</th><th>highway</th><th>@id</th></tr>';
+      const trs = rows.map(r=>`<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.highway||'')}</td><td>${escapeHtml(r.id)}</td></tr>`).join('');
+      wrap.innerHTML = `<table>${header}${trs}</table>`;
+    }
+    function toCSV(rows, cols){
+      const esc = v => '"'+String(v??'').replace(/"/g,'""')+'"';
+      const lines = [cols.join(',')];
+      for (const r of rows){ lines.push(cols.map(c=>esc(r[c])).join(',')); }
+      return lines.join('\n');
+    }
+    function process(json){
+      rowsRaw = (json.elements||[])
+        .filter(el=>el.type==='way' && el.tags && el.tags.name)
+        .map(el=>({ name: el.tags.name, highway: el.tags.highway||'', id: el.id }));
+      const seen = new Set();
+      rowsUnique = [];
+      for (const r of rowsRaw){ const k=r.name.toLowerCase().trim(); if(!seen.has(k)){ seen.add(k); rowsUnique.push({ name:r.name }); } }
+      rowsUnique.sort((a,b)=>a.name.localeCompare(b.name,'fr'));
+      setCounts(rowsUnique.length, rowsRaw.length);
+      renderTable(rowsRaw);
+      id('btn-dl-unique').disabled = rowsUnique.length===0;
+      id('btn-dl-raw').disabled = rowsRaw.length===0;
+    }
+
+    // --- Actions
+    id('btn-query-poly').addEventListener('click', async ()=>{
+      try{
+        const poly = getLastPolygonPoly(); if (!poly){ alert('Dessinez d\'abord un polygone ou un rectangle.'); return; }
+        id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
+        const {endpoint, ql} = buildQL({usePoly:true, polyStr: poly});
+        const json = await runOverpass(ql, endpoint);
+        process(json);
+        log('OK (polygone).','ok');
+      }catch(err){ console.error(err); log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\n'+err.message); }
+    });
+    id('btn-query-bbox').addEventListener('click', async ()=>{
+      try{
+        const bbox = getBbox();
+        id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
+        const {endpoint, ql} = buildQL({useBbox:true, bboxStr: bbox});
+        const json = await runOverpass(ql, endpoint);
+        process(json);
+        log('OK (bbox vue courante).','ok');
+      }catch(err){ console.error(err); log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\n'+err.message); }
+    });
+    id('btn-dl-unique').addEventListener('click', ()=>{
+      if (!rowsUnique.length) return;
+      const csv = toCSV(rowsUnique, ['name']);
+      downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_uniques.csv');
+    });
+    id('btn-dl-raw').addEventListener('click', ()=>{
+      if (!rowsRaw.length) return;
+      const csv = toCSV(rowsRaw, ['name','highway','id']);
+      downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_details.csv');
+    });
   }
-
-  // --- Actions
-  id('btn-query-poly').addEventListener('click', async ()=>{
-    try{
-      const poly = getLastPolygonPoly(); if (!poly){ alert('Dessinez d\'abord un polygone ou un rectangle.'); return; }
-      id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
-      const {endpoint, ql} = buildQL({usePoly:true, polyStr: poly});
-      const json = await runOverpass(ql, endpoint);
-      process(json);
-      log('OK (polygone).', 'ok');
-    }catch(err){ console.error(err); log('Erreur Overpass : '+err.message, 'err'); alert('Erreur Overpass\n'+err.message); }
-  });
-
-  id('btn-query-bbox').addEventListener('click', async ()=>{
-    try{
-      const bbox = getBbox();
-      id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
-      const {endpoint, ql} = buildQL({useBbox:true, bboxStr: bbox});
-      const json = await runOverpass(ql, endpoint);
-      process(json);
-      log('OK (bbox vue courante).', 'ok');
-    }catch(err){ console.error(err); log('Erreur Overpass : '+err.message, 'err'); alert('Erreur Overpass\n'+err.message); }
-  });
-
-  id('btn-dl-unique').addEventListener('click', ()=>{
-    if (!rowsUnique.length) return;
-    const csv = toCSV(rowsUnique, ['name']);
-    downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_uniques.csv');
-  });
-
-  id('btn-dl-raw').addEventListener('click', ()=>{
-    if (!rowsRaw.length) return;
-    const csv = toCSV(rowsRaw, ['name','highway','id']);
-    downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_details.csv');
-  });
 })();
 </script>
 </body>
