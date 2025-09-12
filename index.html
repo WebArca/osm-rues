@@ -13,6 +13,7 @@
     header h1 { font-size: 1.05rem; margin: 0; }
     #toolbar { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; padding: .6rem 1rem; background: var(--muted); border-bottom: 1px solid var(--line); }
     #toolbar button, #toolbar select, #toolbar input { padding: .45rem .7rem; border-radius: .5rem; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; font-size: .95rem; }
+    #toolbar button[disabled] { opacity: .55; cursor: not-allowed; }
     #toolbar button.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
     #toolbar .group { display: inline-flex; gap: .4rem; align-items: center; }
     #toolbar label { font-size: .9rem; color: #334155; }
@@ -142,11 +143,30 @@
       badgeRaw.textContent    = `${r} ${r>1?'tronçons':'tronçon'}`;
     }
     function id(x){return document.getElementById(x)}
-    function downloadBlob(blob, filename) {
-      const url = URL.createObjectURL(blob); const a = document.createElement('a');
-      a.href = url; a.download = filename; document.body.appendChild(a); a.click();
-      setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 500);
+
+    // 🔽🔽🔽 Remplace la vieille fonction de download par une version robuste
+    function downloadCSV(text, filename){
+      // BOM pour Excel + accents
+      const csvText = "\uFEFF" + text;
+      const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+
+      try {
+        a.click(); // cas standard (Chrome/Firefox/Safari récents)
+      } catch (e) {
+        // Fallback : Safari récalcitrant → ouvrir dans un nouvel onglet
+        try { window.open(url, '_blank'); } catch(_) {}
+      }
+      // Laisse un délai avant révocation pour certains navigateurs
+      setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1500);
     }
+    // 🔼🔼🔼
+
     function escapeHtml(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
     function log(msg, cls){ const p=document.createElement('div'); if(cls)p.className=cls; p.textContent=msg; logEl.prepend(p); }
 
@@ -268,8 +288,9 @@
       rowsUnique.sort((a,b)=>a.name.localeCompare(b.name,'fr'));
       setCounts(rowsUnique.length, rowsRaw.length);
       renderTable(rowsRaw);
-      id('btn-dl-unique').disabled = rowsUnique.length===0;
-      id('btn-dl-raw').disabled = rowsRaw.length===0;
+      // (ré)active les boutons si résultats
+      id('btn-dl-unique').disabled = rowsUnique.length===0 ? true : false;
+      id('btn-dl-raw').disabled    = rowsRaw.length===0    ? true : false;
     }
 
     // --- Actions
@@ -293,15 +314,19 @@
         log('OK (bbox vue courante).','ok');
       }catch(err){ console.error(err); log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\n'+err.message); }
     });
+
+    // ✅ Exports (noms uniques / détails) — avec BOM + fallback Safari
     id('btn-dl-unique').addEventListener('click', ()=>{
-      if (!rowsUnique.length) return;
+      if (!rowsUnique.length) { alert('Aucun résultat à exporter. Lancez d\'abord une recherche.'); return; }
       const csv = toCSV(rowsUnique, ['name']);
-      downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_uniques.csv');
+      downloadCSV(csv, 'rues_uniques.csv');
+      log('CSV (noms uniques) téléchargé.','ok');
     });
     id('btn-dl-raw').addEventListener('click', ()=>{
-      if (!rowsRaw.length) return;
+      if (!rowsRaw.length) { alert('Aucun résultat à exporter. Lancez d\'abord une recherche.'); return; }
       const csv = toCSV(rowsRaw, ['name','highway','id']);
-      downloadBlob(new Blob([csv],{type:'text/csv;charset=utf-8'}), 'rues_details.csv');
+      downloadCSV(csv, 'rues_details.csv');
+      log('CSV (détails) téléchargé.','ok');
     });
   }
 })();
