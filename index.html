@@ -8,7 +8,7 @@
     :root { --bg:#0f172a; --muted:#f8fafc; --line:#e2e8f0; --brand:#0284c7; }
     html, body { height: 100%; margin: 0; }
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
-    #app { display: grid; grid-template-rows: auto auto 1fr auto; height: 100vh; }
+    #app { display: grid; grid-template-rows: auto auto minmax(220px, 1fr) minmax(165px, 30vh); height: 100vh; height: 100dvh; min-height: 0; }
     header { padding: .6rem 1rem; background: var(--bg); color: #fff; }
     header h1 { font-size: 1.05rem; margin: 0; }
     #toolbar { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; padding: .6rem 1rem; background: var(--muted); border-bottom: 1px solid var(--line); }
@@ -17,9 +17,9 @@
     #toolbar button.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
     #toolbar .group { display: inline-flex; gap: .4rem; align-items: center; }
     #toolbar label { font-size: .9rem; color: #334155; }
-    #map { width: 100%; height: 80vh; min-height: 520px; }
+    #map { width: 100%; height: 100%; min-height: 0; }
     .leaflet-container { background: #e5e7eb; }
-    #log { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: .9rem; padding: .6rem 1rem; background: #f1f5f9; border-top: 1px solid var(--line); max-height: 28vh; overflow: auto; }
+    #log { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: .9rem; padding: .6rem 1rem; background: #f1f5f9; border-top: 1px solid var(--line); min-height: 0; overflow: auto; }
     #table-wrap { overflow: auto; }
     table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
     th, td { border: 1px solid #e5e7eb; padding: .4rem .5rem; }
@@ -60,6 +60,7 @@
     </div>
 
     <div class="right">
+      <span id="search-status" role="status" aria-live="polite" class="badge">Prêt</span>
       <span id="count-unique" class="badge" title="Rues uniques">0 nom unique</span>
       <span id="count-raw" class="badge" title="Segments (ways)">0 tronçon</span>
       <button id="btn-dl-unique" disabled>CSV (noms uniques)</button>
@@ -136,6 +137,14 @@
   /** Application après chargement des libs **/
   function initApp(){
     const badgeUnique = id('count-unique');
+    const searchStatus = id('search-status');
+    let searching = false;
+    function setSearching(active, message) {
+      searching = active;
+      id('btn-query-poly').disabled = active;
+      id('btn-query-bbox').disabled = active;
+      searchStatus.textContent = message || (active ? 'Recherche en cours…' : 'Prêt');
+    }
     const badgeRaw    = id('count-raw');
     function setCounts(u, r) {
       badgeUnique.textContent = `${u} ${u>1?'noms uniques':'nom unique'}`;
@@ -317,6 +326,10 @@
       rowsUnique.sort((a,b)=>a.name.localeCompare(b.name,'fr'));
       setCounts(rowsUnique.length, rowsRaw.length);
       renderTable(rowsRaw);
+      searchStatus.textContent = rowsUnique.length
+        ? rowsUnique.length + ' noms trouvés'
+        : 'Aucune rue trouvée dans cette zone';
+      log('Résultat : ' + rowsRaw.length + ' tronçons, ' + rowsUnique.length + ' noms uniques.', rowsRaw.length ? 'ok' : 'warn');
       // (ré)active les boutons si résultats
       id('btn-dl-unique').disabled = rowsUnique.length===0 ? true : false;
       id('btn-dl-raw').disabled    = rowsRaw.length===0    ? true : false;
@@ -324,24 +337,30 @@
 
     // --- Actions
     id('btn-query-poly').addEventListener('click', async ()=>{
+      if (searching) return;
       try{
+        setSearching(true);
         const poly = getLastPolygonPoly(); if (!poly){ alert('Dessinez d\'abord un polygone ou un rectangle.'); return; }
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({usePoly:true, polyStr: poly});
         const json = await runOverpass(ql, endpoint);
         process(json);
         log('OK (polygone).','ok');
-      }catch(err){ console.error(err); log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\n'+err.message); }
+      }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
+      finally { setSearching(false, searchStatus.textContent); }
     });
     id('btn-query-bbox').addEventListener('click', async ()=>{
+      if (searching) return;
       try{
+        setSearching(true);
         const bbox = getBbox();
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({useBbox:true, bboxStr: bbox});
         const json = await runOverpass(ql, endpoint);
         process(json);
         log('OK (bbox vue courante).','ok');
-      }catch(err){ console.error(err); log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\n'+err.message); }
+      }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
+      finally { setSearching(false, searchStatus.textContent); }
     });
 
     // ✅ Exports (noms uniques / détails) — avec BOM + fallback Safari
