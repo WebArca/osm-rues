@@ -252,166 +252,53 @@
   out tags;`;
       return { endpoint, ql };
     }
-    // Serveurs publics : interrogation séquentielle pour éviter de les surcharger.
-    async function runOverpass(ql, endpoint, bboxStr = null){
+    async function runOverpass(ql, endpoint){
       const servers = [...new Set([
         endpoint,
         'https://overpass.private.coffee/api/interpreter',
         'https://overpass-api.de/api/interpreter'
       ])];
-      async function request(query, label) {
-        let lastError;
-        for (const server of servers) {
-          const host = new URL(server).host;
-          log(label + ' — serveur ' + host);
-          searchStatus.textContent = label + ' — ' + host;
+      let lastError = null;
+      for (const server of servers) {
+        log('Interrogation de ' + new URL(server).host + '…');
+        for (let attempt = 1; attempt <= 2; attempt++) {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 40000);
+          const timeout = setTimeout(() => controller.abort(), 75000);
           try {
             const res = await fetch(server, {
               method: 'POST',
               mode: 'cors',
               headers: {'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
-              body: new URLSearchParams({data: query}),
+              body: new URLSearchParams({data: ql}),
               signal: controller.signal
             });
             if (!res.ok) {
-              const error = new Error('HTTP ' + res.status);
-              error.status = res.status;
-              throw error;
+              const err = new Error('HTTP ' + res.status);
+              err.status = res.status;
+              throw err;
             }
             const json = await res.json();
             if (!json || !Array.isArray(json.elements))
               throw new Error('Réponse JSON Overpass invalide');
-            log(label + ' — ' + json.elements.length + ' tronçons reçus', 'ok');
+            log('Réponse reçue de ' + new URL(server).host, 'ok');
             return json;
-          } catch (error) {
-            lastError = error;
-            log(label + ' — ' + host + ' : ' + (error.name === 'AbortError' ? 'délai dépassé' : error.message), 'warn');
-            if ([400, 401, 403, 404, 422].includes(error.status)) throw error;
+          } catch (e) {
+            lastError = e;
+            log('Échec ' + new URL(server).host + ' (essai ' + attempt + '/2) : ' + e.message, 'warn');
+            // Les erreurs de requête ne doivent pas être répétées sur les autres serveurs.
+            if ([400, 401, 403, 404, 422].includes(e.status)) throw e;
+            // Après une erreur de surcharge, changer directement de serveur.
+            if ([429, 502, 503, 504].includes(e.status)) break;
+            if (attempt < 2)
+              await new Promise(resolve => setTimeout(resolve, 2000));
           } finally {
-            clearTimeout(timer);
+            clearTimeout(timeout);
           }
         }
-        throw lastError || new Error('Serveurs Overpass indisponibles');
+        if (server !== servers[servers.length - 1])
+          log('Basculement automatique vers un autre serveur…', 'warn');
       }
-
-      function splitBbox(bbox) {
-        const coords = bbox.split(',').map(Number);
-        if (coords.length !== 4 || !coords.every(Number.isFinite)) return null;
-        const [south, west, north, east] = coords;
-        if (north <= south || east <= west) return null;
-        const midLat = (south + north) / 2, midLon = (west + east) / 2;
-        return [
-          [south, west, midLat, midLon].join(','),
-          [south, midLon, midLat, east].join(','),
-          [midLat, west, north, midLon].join(','),
-          [midLat, midLon, north, east].join(',')
-        ];
-      }
-
-      const chunks = bboxStr ? splitBbox(bboxStr) : null;
-      const coords = bboxStr ? bboxStr.split(',').map(Number) : null;
-      const largeArea = chunks && (coords[2] - coords[0] > 0.018 || coords[3] - coords[1] > 0.025);
-      if (!largeArea) {
-        try {
-          return await request(ql, 'Recherche');
-        } catch (error) {
-          if (!chunks || [400, 401, 403, 404, 422].includes(error.status)) throw error;
-          log('Recherche globale indisponible : découpage en quatre secteurs…', 'warn');
-        }
-      } else {
-        log('Zone étendue : recherche en quatre secteurs pour alléger les requêtes.', 'warn');
-      }
-      if (!chunks) throw new Error('Impossible de découper la zone sélectionnée');
-      const collected = new Map();
-      for (let i = 0; i < chunks.length; i++) {
-        const pieceQL = ql.replace('(' + bboxStr + ')', '(' + chunks[i] + ')');
-        if (pieceQL === ql) throw new Error('Impossible de préparer le secteur ' + (i+1));
-        const result = await request(pieceQL, 'Secteur ' + (i+1) + '/4');
-        for (const element of result.elements) {
-          if (element.type === 'way') collected.set(element.id, element);
-        }
-        // Espacer les requêtes sur les instances publiques.
-        if (i < chunks.length - 1) await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-      log('Quatre secteurs réunis : ' + collected.size + ' tronçons distincts.', 'ok');
-      return {elements: [...collected.values()]};
-    }
-
-    // Découpe un polygone en sous-polygones limités à chaque secteur.
-    // Le filtrage reste géographique : on ne remplace pas le polygone par une BBOX.
-    function polygonTiles(polyStr) {
-      let ring = polyStr.trim().split(/\s+/).map(Number);
-      if (ring.length < 6 || ring.length % 2 || ring.some(x=>!Number.isFinite(x))) return [];
-      let points = [];
-      for(let i=0;i<ring.length;i+=2) points.push({lat:ring[i],lon:ring[i+1]});
-      if(points.length>1 && points[0].lat===points.at(-1).lat && points[0].lon===points.at(-1).lon) points.pop();
-      if(points.length<3) return [];
-      const lats=points.map(p=>p.lat),lons=points.map(p=>p.lon);
-      const south=Math.min(...lats),north=Math.max(...lats),west=Math.min(...lons),east=Math.max(...lons);
-      if(north===south || east===west) return [];
-      const divisions = (north-south>0.04 || east-west>0.05) ? 4 : 2;
-      const clip=(input,axis,bound,keepGreater)=>{
-        const output=[];
-        const inside=p=>keepGreater ? p[axis]>=bound-1e-10 : p[axis]<=bound+1e-10;
-        for(let i=0;i<input.length;i++){
-          const current=input[i], previous=input[(i+input.length-1)%input.length];
-          const a=inside(previous),b=inside(current);
-          if(a!==b){
-            const ratio=(bound-previous[axis])/(current[axis]-previous[axis]);
-            output.push({lat:previous.lat+ratio*(current.lat-previous.lat),
-                         lon:previous.lon+ratio*(current.lon-previous.lon)});
-          }
-          if(b)output.push(current);
-        }
-        return output;
-      };
-      const tiles=[];
-      for(let y=0;y<divisions;y++)for(let x=0;x<divisions;x++){
-        const s=south+(north-south)*y/divisions,n=south+(north-south)*(y+1)/divisions;
-        const w=west+(east-west)*x/divisions,e=west+(east-west)*(x+1)/divisions;
-        let part=clip(points,'lat',s,true);
-        if(part.length)part=clip(part,'lat',n,false);
-        if(part.length)part=clip(part,'lon',w,true);
-        if(part.length)part=clip(part,'lon',e,false);
-        const cleaned=part.filter((p,i)=>i===0||Math.abs(p.lat-part[i-1].lat)>1e-9||Math.abs(p.lon-part[i-1].lon)>1e-9);
-        if(cleaned.length>2){
-          const first=cleaned[0],last=cleaned[cleaned.length-1];
-          if(Math.abs(first.lat-last.lat)>1e-9||Math.abs(first.lon-last.lon)>1e-9)cleaned.push({...first});
-          const str=cleaned.map(p=>p.lat.toFixed(7)+' '+p.lon.toFixed(7)).join(' ');
-          tiles.push(str);
-        }
-      }
-      return tiles;
-    }
-
-    async function runPolygonOverpass(ql, endpoint, polyStr) {
-      const tiles=polygonTiles(polyStr);
-      if(!tiles.length) throw new Error('Polygone invalide');
-      // Les grands polygones sont divisés immédiatement ; les petits seulement si nécessaire.
-      const values=polyStr.trim().split(/\s+/).map(Number);
-      const lats=values.filter((_,i)=>i%2===0),lons=values.filter((_,i)=>i%2===1);
-      const large=Math.max(...lats)-Math.min(...lats)>0.018 ||
-                  Math.max(...lons)-Math.min(...lons)>0.025;
-      if(!large){
-        try{return await runOverpass(ql,endpoint);}
-        catch(e){if([400,401,403,404,422].includes(e.status))throw e;
-          log('Nouvelle tentative par secteurs du polygone…','warn');
-        }
-      }
-      log('Polygone découpé en '+tiles.length+' secteurs pour réduire les délais.','warn');
-      const all=new Map();
-      for(let i=0;i<tiles.length;i++){
-        const tileQL=ql.replace('(poly:"'+polyStr+'")','(poly:"'+tiles[i]+'")');
-        if(tileQL===ql) throw new Error('Découpage du polygone impossible');
-        searchStatus.textContent='Polygone : secteur '+(i+1)+'/'+tiles.length;
-        const res=await runOverpass(tileQL,endpoint);
-        for(const item of res.elements)if(item.type==='way')all.set(item.id,item);
-        log('Polygone : secteur '+(i+1)+'/'+tiles.length+' terminé','ok');
-        if(i<tiles.length-1)await new Promise(r=>setTimeout(r,750));
-      }
-      return {elements:[...all.values()]};
+      throw new Error('Tous les serveurs Overpass ont échoué : ' + (lastError?.message || 'erreur inconnue'));
     }
 
     // --- Rendu & CSV
@@ -456,7 +343,7 @@
         const poly = getLastPolygonPoly(); if (!poly){ alert('Dessinez d\'abord un polygone ou un rectangle.'); return; }
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({usePoly:true, polyStr: poly});
-        const json = await runPolygonOverpass(ql, endpoint, poly);
+        const json = await runOverpass(ql, endpoint);
         process(json);
         log('OK (polygone).','ok');
       }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
@@ -469,7 +356,7 @@
         const bbox = getBbox();
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({useBbox:true, bboxStr: bbox});
-        const json = await runOverpass(ql, endpoint, bbox);
+        const json = await runOverpass(ql, endpoint);
         process(json);
         log('OK (bbox vue courante).','ok');
       }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
