@@ -339,6 +339,81 @@
       return {elements: [...collected.values()]};
     }
 
+    // Découpe un polygone en sous-polygones limités à chaque secteur.
+    // Le filtrage reste géographique : on ne remplace pas le polygone par une BBOX.
+    function polygonTiles(polyStr) {
+      let ring = polyStr.trim().split(/\\s+/).map(Number);
+      if (ring.length < 6 || ring.length % 2 || ring.some(x=>!Number.isFinite(x))) return [];
+      let points = [];
+      for(let i=0;i<ring.length;i+=2) points.push({lat:ring[i],lon:ring[i+1]});
+      if(points.length>1 && points[0].lat===points.at(-1).lat && points[0].lon===points.at(-1).lon) points.pop();
+      if(points.length<3) return [];
+      const lats=points.map(p=>p.lat),lons=points.map(p=>p.lon);
+      const south=Math.min(...lats),north=Math.max(...lats),west=Math.min(...lons),east=Math.max(...lons);
+      if(north===south || east===west) return [];
+      const divisions = (north-south>0.04 || east-west>0.05) ? 4 : 2;
+      const clip=(input,axis,bound,keepGreater)=>{
+        const output=[];
+        const inside=p=>keepGreater ? p[axis]>=bound-1e-10 : p[axis]<=bound+1e-10;
+        for(let i=0;i<input.length;i++){
+          const current=input[i], previous=input[(i+input.length-1)%input.length];
+          const a=inside(previous),b=inside(current);
+          if(a!==b){
+            const ratio=(bound-previous[axis])/(current[axis]-previous[axis]);
+            output.push({lat:previous.lat+ratio*(current.lat-previous.lat),
+                         lon:previous.lon+ratio*(current.lon-previous.lon)});
+          }
+          if(b)output.push(current);
+        }
+        return output;
+      };
+      const tiles=[];
+      for(let y=0;y<divisions;y++)for(let x=0;x<divisions;x++){
+        const s=south+(north-south)*y/divisions,n=south+(north-south)*(y+1)/divisions;
+        const w=west+(east-west)*x/divisions,e=west+(east-west)*(x+1)/divisions;
+        let part=clip(points,'lat',s,true);
+        if(part.length)part=clip(part,'lat',n,false);
+        if(part.length)part=clip(part,'lon',w,true);
+        if(part.length)part=clip(part,'lon',e,false);
+        const cleaned=part.filter((p,i)=>i===0||Math.abs(p.lat-part[i-1].lat)>1e-9||Math.abs(p.lon-part[i-1].lon)>1e-9);
+        if(cleaned.length>2){
+          const first=cleaned[0],last=cleaned[cleaned.length-1];
+          if(Math.abs(first.lat-last.lat)>1e-9||Math.abs(first.lon-last.lon)>1e-9)cleaned.push({...first});
+          const str=cleaned.map(p=>p.lat.toFixed(7)+' '+p.lon.toFixed(7)).join(' ');
+          tiles.push(str);
+        }
+      }
+      return tiles;
+    }
+
+    async function runPolygonOverpass(ql, endpoint, polyStr) {
+      const tiles=polygonTiles(polyStr);
+      if(!tiles.length) throw new Error('Polygone invalide');
+      // Les grands polygones sont divisés immédiatement ; les petits seulement si nécessaire.
+      const values=polyStr.trim().split(/\\s+/).map(Number);
+      const lats=values.filter((_,i)=>i%2===0),lons=values.filter((_,i)=>i%2===1);
+      const large=Math.max(...lats)-Math.min(...lats)>0.018 ||
+                  Math.max(...lons)-Math.min(...lons)>0.025;
+      if(!large){
+        try{return await runOverpass(ql,endpoint);}
+        catch(e){if([400,401,403,404,422].includes(e.status))throw e;
+          log('Nouvelle tentative par secteurs du polygone…','warn');
+        }
+      }
+      log('Polygone découpé en '+tiles.length+' secteurs pour réduire les délais.','warn');
+      const all=new Map();
+      for(let i=0;i<tiles.length;i++){
+        const tileQL=ql.replace('(poly:"'+polyStr+'")','(poly:"'+tiles[i]+'")');
+        if(tileQL===ql) throw new Error('Découpage du polygone impossible');
+        searchStatus.textContent='Polygone : secteur '+(i+1)+'/'+tiles.length;
+        const res=await runOverpass(tileQL,endpoint);
+        for(const item of res.elements)if(item.type==='way')all.set(item.id,item);
+        log('Polygone : secteur '+(i+1)+'/'+tiles.length+' terminé','ok');
+        if(i<tiles.length-1)await new Promise(r=>setTimeout(r,750));
+      }
+      return {elements:[...all.values()]};
+    }
+
     // --- Rendu & CSV
     let rowsRaw = [], rowsUnique = [];
     function renderTable(rows){
@@ -381,7 +456,7 @@
         const poly = getLastPolygonPoly(); if (!poly){ alert('Dessinez d\'abord un polygone ou un rectangle.'); return; }
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({usePoly:true, polyStr: poly});
-        const json = await runOverpass(ql, endpoint);
+        const json = await runPolygonOverpass(ql, endpoint, poly);
         process(json);
         log('OK (polygone).','ok');
       }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
