@@ -252,53 +252,91 @@
   out tags;`;
       return { endpoint, ql };
     }
-    async function runOverpass(ql, endpoint){
+    // Serveurs publics : interrogation séquentielle pour éviter de les surcharger.
+    async function runOverpass(ql, endpoint, bboxStr = null){
       const servers = [...new Set([
         endpoint,
         'https://overpass.private.coffee/api/interpreter',
         'https://overpass-api.de/api/interpreter'
       ])];
-      let lastError = null;
-      for (const server of servers) {
-        log('Interrogation de ' + new URL(server).host + '…');
-        for (let attempt = 1; attempt <= 2; attempt++) {
+      async function request(query, label) {
+        let lastError;
+        for (const server of servers) {
+          const host = new URL(server).host;
+          log(label + ' — serveur ' + host);
+          searchStatus.textContent = label + ' — ' + host;
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 75000);
+          const timer = setTimeout(() => controller.abort(), 40000);
           try {
             const res = await fetch(server, {
               method: 'POST',
               mode: 'cors',
               headers: {'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
-              body: new URLSearchParams({data: ql}),
+              body: new URLSearchParams({data: query}),
               signal: controller.signal
             });
             if (!res.ok) {
-              const err = new Error('HTTP ' + res.status);
-              err.status = res.status;
-              throw err;
+              const error = new Error('HTTP ' + res.status);
+              error.status = res.status;
+              throw error;
             }
             const json = await res.json();
             if (!json || !Array.isArray(json.elements))
               throw new Error('Réponse JSON Overpass invalide');
-            log('Réponse reçue de ' + new URL(server).host, 'ok');
+            log(label + ' — ' + json.elements.length + ' tronçons reçus', 'ok');
             return json;
-          } catch (e) {
-            lastError = e;
-            log('Échec ' + new URL(server).host + ' (essai ' + attempt + '/2) : ' + e.message, 'warn');
-            // Les erreurs de requête ne doivent pas être répétées sur les autres serveurs.
-            if ([400, 401, 403, 404, 422].includes(e.status)) throw e;
-            // Après une erreur de surcharge, changer directement de serveur.
-            if ([429, 502, 503, 504].includes(e.status)) break;
-            if (attempt < 2)
-              await new Promise(resolve => setTimeout(resolve, 2000));
+          } catch (error) {
+            lastError = error;
+            log(label + ' — ' + host + ' : ' + (error.name === 'AbortError' ? 'délai dépassé' : error.message), 'warn');
+            if ([400, 401, 403, 404, 422].includes(error.status)) throw error;
           } finally {
-            clearTimeout(timeout);
+            clearTimeout(timer);
           }
         }
-        if (server !== servers[servers.length - 1])
-          log('Basculement automatique vers un autre serveur…', 'warn');
+        throw lastError || new Error('Serveurs Overpass indisponibles');
       }
-      throw new Error('Tous les serveurs Overpass ont échoué : ' + (lastError?.message || 'erreur inconnue'));
+
+      function splitBbox(bbox) {
+        const coords = bbox.split(',').map(Number);
+        if (coords.length !== 4 || !coords.every(Number.isFinite)) return null;
+        const [south, west, north, east] = coords;
+        if (north <= south || east <= west) return null;
+        const midLat = (south + north) / 2, midLon = (west + east) / 2;
+        return [
+          [south, west, midLat, midLon].join(','),
+          [south, midLon, midLat, east].join(','),
+          [midLat, west, north, midLon].join(','),
+          [midLat, midLon, north, east].join(',')
+        ];
+      }
+
+      const chunks = bboxStr ? splitBbox(bboxStr) : null;
+      const coords = bboxStr ? bboxStr.split(',').map(Number) : null;
+      const largeArea = chunks && (coords[2] - coords[0] > 0.018 || coords[3] - coords[1] > 0.025);
+      if (!largeArea) {
+        try {
+          return await request(ql, 'Recherche');
+        } catch (error) {
+          if (!chunks || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+          log('Recherche globale indisponible : découpage en quatre secteurs…', 'warn');
+        }
+      } else {
+        log('Zone étendue : recherche en quatre secteurs pour alléger les requêtes.', 'warn');
+      }
+      if (!chunks) throw new Error('Impossible de découper la zone sélectionnée');
+      const collected = new Map();
+      for (let i = 0; i < chunks.length; i++) {
+        const pieceQL = ql.replace('(' + bboxStr + ')', '(' + chunks[i] + ')');
+        if (pieceQL === ql) throw new Error('Impossible de préparer le secteur ' + (i+1));
+        const result = await request(pieceQL, 'Secteur ' + (i+1) + '/4');
+        for (const element of result.elements) {
+          if (element.type === 'way') collected.set(element.id, element);
+        }
+        // Espacer les requêtes sur les instances publiques.
+        if (i < chunks.length - 1) await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      log('Quatre secteurs réunis : ' + collected.size + ' tronçons distincts.', 'ok');
+      return {elements: [...collected.values()]};
     }
 
     // --- Rendu & CSV
@@ -356,7 +394,7 @@
         const bbox = getBbox();
         id('table-wrap').innerHTML=''; setCounts(0,0); id('btn-dl-unique').disabled = id('btn-dl-raw').disabled = true;
         const {endpoint, ql} = buildQL({useBbox:true, bboxStr: bbox});
-        const json = await runOverpass(ql, endpoint);
+        const json = await runOverpass(ql, endpoint, bbox);
         process(json);
         log('OK (bbox vue courante).','ok');
       }catch(err){ console.error(err); searchStatus.textContent='Échec de recherche'; log('Erreur Overpass : '+err.message,'err'); alert('Erreur Overpass\\n'+err.message); }
