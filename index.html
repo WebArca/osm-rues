@@ -342,7 +342,7 @@
     // Découpe un polygone en sous-polygones limités à chaque secteur.
     // Le filtrage reste géographique : on ne remplace pas le polygone par une BBOX.
     function polygonTiles(polyStr) {
-      let ring = polyStr.trim().split(/\\s+/).map(Number);
+      let ring = polyStr.trim().split(/\s+/).map(Number);
       if (ring.length < 6 || ring.length % 2 || ring.some(x=>!Number.isFinite(x))) return [];
       let points = [];
       for(let i=0;i<ring.length;i+=2) points.push({lat:ring[i],lon:ring[i+1]});
@@ -390,7 +390,7 @@
       const tiles=polygonTiles(polyStr);
       if(!tiles.length) throw new Error('Polygone invalide');
       // Les grands polygones sont divisés immédiatement ; les petits seulement si nécessaire.
-      const values=polyStr.trim().split(/\\s+/).map(Number);
+      const values=polyStr.trim().split(/\s+/).map(Number);
       const lats=values.filter((_,i)=>i%2===0),lons=values.filter((_,i)=>i%2===1);
       const large=Math.max(...lats)-Math.min(...lats)>0.018 ||
                   Math.max(...lons)-Math.min(...lons)>0.025;
